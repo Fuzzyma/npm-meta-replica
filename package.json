@@ -1,0 +1,32 @@
+{
+  "name": "npm-meta-replica",
+  "description": "Replicating some meta data from npm registry",
+  "version": "0.0.0",
+  "scripts": {
+    "build": "docker build -t local-couchdb .",
+    "start": "docker run -d -p 5984:5984 --name local-couchdb local-couchdb"
+  },
+  "dependencies": {
+    "@types/node": "^22.9.1",
+    "algoliasearch": "^5.15.0",
+    "csv": "0.3.6",
+    "lodash": "~2.4.1",
+    "nano": "~5.10.0",
+    "p-limit": "^6.1.0",
+    "p-throttle": "^6.2.0",
+    "picocolors": "^1.1.1",
+    "semver-utils": "~1.1.0",
+    "underscore-cli": ">= 0.2.17"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com:Fuzzyma/npm-meta-replica.git"
+  },
+  "main": "replicate.js",
+  "author": "Ulrich-Matthias Schäfer",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Fuzzyma/npm-meta-replica/issues"
+  },
+  "homepage": "https://github.com/Fuzzyma/npm-meta-replica#readme"
+}
