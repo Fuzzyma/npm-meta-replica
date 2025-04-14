@@ -16,11 +16,6 @@ async function getCheckpoint() {
   }
 }
 
-async function saveCheckpoint(startKey) {
-  const checkpointData = JSON.stringify({ startKey }, null, 2);
-  await fsp.writeFile(checkpointFile, checkpointData, "utf8");
-}
-
 let totalDocs = null;
 let fetchedCount = 0;
 async function* fetchDocuments(batchSize = 10000) {
@@ -86,7 +81,7 @@ async function main() {
   let total = 0;
   let runs = 1;
 
-  for await (const { docs, lastKey } of fetchDocuments()) {
+  for await (const { docs } of fetchDocuments()) {
     if (stop) {
       writableStream.close(() => {
         process.exit();

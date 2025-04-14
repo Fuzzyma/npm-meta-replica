@@ -4,6 +4,12 @@ import pc from "picocolors";
 import * as readline from "readline";
 import fs from "fs/promises";
 import { setTimeout } from "timers/promises";
+import { client } from "./api-client";
+
+const localDbUrl = "https://npm.devminer.xyz/registry";
+const auth = "";
+const authHeader = "Basic " + Buffer.from(auth).toString("base64");
+const checkpointFile = "checkpoint.json";
 
 export type PackageDetails =
   | {
@@ -19,6 +25,8 @@ export type PackageDetails =
       devDependencies: Record<string, string>;
       unpackedSize: number;
       fileCount: number;
+      modified: number;
+      deprecated: boolean;
     };
 
 const registries = [
@@ -76,6 +84,16 @@ async function fetchPackageDetails(packageName: string, registry: string) {
         }
       );
       if (!response.ok) {
+        if (response.status === 403) {
+          console.log(
+            `Package ${packageName} access forbidden. Trying other registry.`
+          );
+          return fetchPackageDetails(
+            packageName,
+            "https://registry.yarnpkg.com/"
+          );
+        }
+
         if (response.status === 404) {
           return {
             name: packageName,
@@ -127,6 +145,7 @@ async function fetchPackageDetails(packageName: string, registry: string) {
         version: string;
         dependencies: Record<string, string>;
         devDependencies: Record<string, string>;
+        deprecated: string;
       };
 
       // const [sizeResponse, downloadsResponse] = await Promise.all([
@@ -152,6 +171,7 @@ async function fetchPackageDetails(packageName: string, registry: string) {
         devDependencies: data.devDependencies ?? {},
         unpackedSize,
         fileCount,
+        deprecated: !!data.deprecated,
       };
     } catch (error) {
       if (error instanceof TooLargeError) {
@@ -191,110 +211,7 @@ async function fetchPackageDetails(packageName: string, registry: string) {
   }
 }
 
-async function fetchDownloadStats(packageNames: string[]) {
-  const filered = packageNames.filter(
-    (packageName) => !packageName.startsWith("@")
-  );
-
-  // slice them into arrays with 128 elements
-  // make sure those elements joined together are longer than 2048 characters
-  const chunks: string[] = [];
-  let list = "";
-  let cnt = 0;
-  for (let i = 0; i < filered.length; i++) {
-    if (list.length + filered[i].length + 1 > 4000 || cnt === 128) {
-      chunks.push(list);
-      cnt = 0;
-      list = "";
-    }
-
-    list += list ? "," + filered[i] : filered[i];
-    cnt++;
-  }
-
-  chunks.push(list);
-
-  const rateLimited = pThrottle({ limit: 1, interval: 1000 });
-
-  const statsArr = await Promise.all(
-    chunks.map(async (chunk) => {
-      // const all = chunk.join(",");
-
-      const json = await rateLimited(async () => {
-        while (true) {
-          try {
-            const statsResposne = await fetch(
-              `https://api.npmjs.org/downloads/point/last-month/${chunk}`,
-              {
-                credentials: "omit",
-                headers: {
-                  "User-Agent":
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0",
-                  Accept:
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                  "Accept-Language": "de,en-US;q=0.7,en;q=0.3",
-                  "Upgrade-Insecure-Requests": "1",
-                  "Sec-Fetch-Dest": "document",
-                  "Sec-Fetch-Mode": "navigate",
-                  "Sec-Fetch-Site": "cross-site",
-                  Priority: "u=0, i",
-                  Pragma: "no-cache",
-                  "Cache-Control": "no-cache",
-                },
-                method: "GET",
-                mode: "cors",
-              }
-            );
-
-            if (!statsResposne.ok) {
-              console.log(statsResposne.statusText, statsResposne.status);
-              if (
-                statsResposne.status === 429 ||
-                statsResposne.status === 403
-              ) {
-                if (statsResposne.status === 403) {
-                  console.warn(
-                    `https://api.npmjs.org/downloads/point/last-month/${chunk}`
-                  );
-                }
-
-                console.log("Rate Limited, Waiting 10 sec");
-                await setTimeout(10000);
-              }
-              continue;
-            }
-
-            const json = (await statsResposne.json()) as Record<
-              string,
-              { downloads: number }
-            >;
-            return json;
-          } catch (e) {
-            console.log(e);
-            await setTimeout(1000);
-          }
-        }
-      })();
-
-      //console.log(Object.keys(json).length);
-
-      return packageNames.map((name) => {
-        return {
-          name,
-          downloads: (json[name]?.downloads as number | undefined) ?? null,
-        };
-      });
-    })
-  );
-
-  return statsArr.flat();
-}
-
-type PromiseType<T extends Promise<any>> = T extends Promise<infer X>
-  ? X
-  : never;
-
-function progressPromise<T extends Promise<any>, X extends PromiseType<T>>(
+function progressPromise<T extends Promise<any>, X extends Awaited<T>>(
   promises: T[],
   tickCallback
 ): Promise<X[]> {
@@ -317,6 +234,56 @@ function progressPromise<T extends Promise<any>, X extends PromiseType<T>>(
   }
 
   return Promise.all(promises.map(tick));
+}
+
+async function getDownloadStats(packageNames: string[]) {
+  // chunk packageNames into 1000 array chunks
+  const packageChunks = packageNames
+    .map((packageName) => [packageName])
+    .reduce(
+      (acc, curr) => {
+        if (acc[acc.length - 1].length < 1000) {
+          acc[acc.length - 1].push(...curr);
+        } else {
+          acc.push(curr);
+        }
+        return acc;
+      },
+      [[]] as string[][]
+    );
+
+  const result = await Promise.all(
+    packageChunks.map(async (packageNames) => {
+      while (true) {
+        try {
+          const response = await client.getObjects<{
+            downloadsLast30Days: number;
+            objectID: string;
+            modified: number;
+          }>({
+            requests: packageNames.map((packageName) => {
+              return {
+                indexName: "npm-search",
+                objectID: packageName,
+                attributesToRetrieve: ["downloadsLast30Days", "modified"],
+              };
+            }),
+          });
+
+          return response.results.map((result, index) => ({
+            name: result?.objectID ?? packageNames[index],
+            downloads: result?.downloadsLast30Days ?? null,
+            modified: result?.modified ?? null,
+          }));
+        } catch (error) {
+          console.log(error);
+          await setTimeout(1000);
+        }
+      }
+    })
+  );
+
+  return result.flat();
 }
 
 export async function fetchPackagesInfo(
@@ -343,7 +310,7 @@ export async function fetchPackagesInfo(
   });
 
   const [allDownloads, results] = await Promise.all([
-    fetchDownloadStats(packageNames),
+    getDownloadStats(packageNames),
     progressPromise(fetchTasks, (progress, len, pck, registry, time) => {
       readline.clearLine(process.stdout, 0);
       readline.cursorTo(process.stdout, 0);
@@ -362,6 +329,7 @@ export async function fetchPackagesInfo(
     return {
       ...result,
       downloads: stats?.downloads ?? null,
+      modified: stats?.modified ?? 0,
     };
   });
 
@@ -386,10 +354,23 @@ export async function fetchPackagesInfo(
   // });
 }
 
-const localDbUrl = "http://localhost:5984/registry2";
-const authHeader = "Basic " + Buffer.from("admin:admin").toString("base64");
-const checkpointFile = "checkpoint4.json"; // File to store the last processed startKey
-const includeDocs = false;
+type Entry = {
+  id: string;
+  key: string;
+  value: {
+    rev: string;
+  };
+  doc: {
+    _id: string;
+    _rev: string;
+    version: string;
+    downloads: number;
+    dependencies: object;
+    devDependencies: object;
+    unpackedSize: number;
+    fileCount: number;
+  };
+};
 
 async function getCheckpoint() {
   try {
@@ -406,7 +387,7 @@ async function saveCheckpoint(startKey) {
   await fs.writeFile(checkpointFile, checkpointData, "utf8");
 }
 
-let totalDocs = null;
+let totalDocs: number | null = null;
 let fetchedCount = 0;
 async function* fetchDocuments(batchSize = 100) {
   let { startKey: lastKey } = await getCheckpoint();
@@ -419,7 +400,12 @@ async function* fetchDocuments(batchSize = 100) {
       JSON.stringify(lastKey)
     )}&include_docs=true`;
 
-    let data;
+    let data: {
+      rows: Entry[];
+      total_rows: number;
+      error: string;
+      offset: number;
+    };
     while (true) {
       try {
         const response = await fetch(url, {
@@ -428,6 +414,7 @@ async function* fetchDocuments(batchSize = 100) {
           },
         });
         data = await response.json();
+
         if (!data || data.error)
           throw new Error((data && data.error) || "Empty response");
         break;
@@ -446,70 +433,93 @@ async function* fetchDocuments(batchSize = 100) {
     if (data.rows.length === 0) {
       hasMore = false;
     } else {
-      const rows = data.rows.filter((row) => !row.doc.dependencies);
-
       console.log(`Fetched ${fetchedCount} / ${totalDocs} documents`);
 
-      if (includeDocs) {
-        lastKey = data.rows[data.rows.length - 1].id;
-        yield {
-          docs: rows,
-          lastKey: data.rows[data.rows.length - 1].id,
-        };
-      } else {
-        lastKey = data.rows[data.rows.length - 1].id;
-        yield {
-          docs: rows,
-          lastKey: lastKey,
-        };
-      }
+      lastKey = data.rows[data.rows.length - 1].id;
+      yield {
+        docs: data.rows.filter((d) => !d.id.startsWith("_design")),
+        lastKey: lastKey,
+      };
     }
   }
 }
+
+const hasXDashes = (id: string, x = 5) => {
+  if (id.startsWith("@")) return id.split("/")[1].split("-").length >= x;
+  return id.split("-").length >= x;
+};
+
 let cnt = 0;
 let total = 0;
 let packagesFetched = 0;
 async function main(batchSize = 100) {
   for await (const { docs, lastKey } of fetchDocuments(batchSize)) {
     const overall = performance.now();
-    const d = docs.map((d) => d.id);
+    const d = docs
+      .filter((d) => !hasXDashes(d.id) && d.doc.downloads > 1000)
+      .map((d) => d.id);
+
+    // const filtered = docs
+    //   .filter((d) => hasXDashes(d.id) || d.doc.downloads <= 1000)
+    //   .map((d) => d.id);
+
+    if (d.length === 0) {
+      await saveCheckpoint(lastKey);
+      continue;
+    }
 
     const packageinfo = await fetchPackagesInfo(d, 200);
 
     packagesFetched += packageinfo.length;
 
     const bulkDocsPayload = {
-      docs: packageinfo.map((doc, index) => {
-        const _rev = docs[index].value.rev;
+      docs: packageinfo
+        .map((doc) => {
+          const _rev = docs.find((d) => d.id === doc.name)?.value?.rev;
 
-        if (doc.error === 404) {
+          if (!_rev) {
+            console.log("Missing rev for", doc.name);
+            process.exit();
+            return null;
+          }
+
+          if (doc.error === 404) {
+            return {
+              _id: doc.name,
+              _rev: _rev,
+              _deleted: true,
+            };
+          }
+
+          if (doc.error) {
+            return {
+              _id: doc.name,
+              _rev: _rev,
+              error: doc.error.message,
+            };
+          }
+
           return {
             _id: doc.name,
             _rev: _rev,
-            _deleted: true,
+            version: doc.latestVersion,
+            downloads: doc.downloads,
+            dependencies: doc.dependencies,
+            devDependencies: doc.devDependencies,
+            unpackedSize: doc.unpackedSize,
+            fileCount: doc.fileCount,
+            modified: doc.modified,
+            deprecated: doc.deprecated,
           };
-        }
-
-        if (doc.error) {
-          return {
-            _id: doc.name,
-            _rev: _rev,
-            error: doc.error.message,
-          };
-        }
-
-        return {
-          _id: doc.name,
-          _rev: _rev,
-          version: doc.latestVersion,
-          downloads: doc.downloads,
-          dependencies: doc.dependencies,
-          devDependencies: doc.devDependencies,
-          unpackedSize: doc.unpackedSize,
-          fileCount: doc.fileCount,
-        };
-      }),
+        })
+        .filter(Boolean),
     };
+
+    // 40MB max
+    if (JSON.stringify(bulkDocsPayload).length > 40000000) {
+      console.error("Payload too big. Adjust batch size");
+      process.exit(0);
+    }
 
     while (true) {
       try {
@@ -522,9 +532,25 @@ async function main(batchSize = 100) {
           body: JSON.stringify(bulkDocsPayload),
         });
 
+        const responses = await response.json().catch(async () => {
+          console.log(await response.text(), bulkDocsPayload);
+          return { ok: false };
+        });
+
         if (!response.ok) {
           console.error("Failed to enrich documents:", await response.text());
           await setTimeout(2000);
+        } else if (responses.some((r) => r.error)) {
+          console.error(
+            "Failed to enrich documents:",
+            responses.filter((r) => r.error)[0]
+          );
+          console.log(
+            bulkDocsPayload.docs.find(
+              (r) => r!._id === responses.filter((r) => r.error)[0].id
+            )
+          );
+          process.exit();
         } else {
           readline.moveCursor(process.stdout, 0, 1);
           // readline.clearLine(process.stdout, 0);
@@ -533,7 +559,10 @@ async function main(batchSize = 100) {
             "Last key:",
             pc.red(lastKey)
           );
-          await saveCheckpoint(lastKey); // + "\u0000" Save the checkpoint after each successful batch
+          // if (filtered.length > 0) {
+          //   await fs.appendFile("filtered.txt", filtered.join("\n") + "\n");
+          // }
+          await saveCheckpoint(lastKey);
           const ti = (performance.now() - overall) / 1000;
           total += ti;
           const pckPerS = packagesFetched / total;
@@ -559,4 +588,4 @@ async function main(batchSize = 100) {
   process.exit(0);
 }
 
-main(4096).catch(console.error);
+main(10000).catch(console.error);
